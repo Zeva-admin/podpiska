@@ -59,10 +59,20 @@ function dto(row, req, config) {
 async function syncSubscription(row, store, threeXui, happ) {
   let traffic = { upload: Number(row.used_upload_bytes || 0), download: Number(row.used_download_bytes || 0) };
   if (row.three_xui_email && threeXui) try { const response = await threeXui.traffic(row.three_xui_email); const data = response?.obj || response || {}; traffic = { upload: Number(data.up || data.upload || 0), download: Number(data.down || data.download || 0) }; await store.updateSync(row.id, traffic); } catch { /* stale statistics are safer than breaking a valid subscription */ }
-  if (row.install_code && row.device_limit > 0 && happ && row.three_xui_email) {
-    try { const response = await happ.listHwid(row.install_code); const entries = response?.obj || []; const devices = entries.map((device) => ({ hwid: device.hwid || device.HWID || String(device), os: device.os || device.platform || "", firstSeen: device.created_at || device.first_seen, lastSeen: device.updated_at || device.last_seen })); await store.upsertDevices(row.id, devices); } catch { /* Happ telemetry can be temporarily unavailable */ }
+  if (row.install_code && row.device_limit > 0 && happ) {
+    try { const response = await happ.listHwid(row.install_code); const entries = response?.data || response?.obj || []; const devices = entries.map((device) => ({ hwid: device.hwid || device.HWID || String(device), os: device.os || device.platform || device.device_name || "", firstSeen: device.created_at || device.first_seen || device.date, lastSeen: device.updated_at || device.last_seen || device.date })); await store.upsertDevices(row.id, devices); } catch { /* Happ telemetry can be temporarily unavailable */ }
   }
   return traffic;
+}
+
+function activeHappStatus(status) { return status === "active" ? 10 : 5; }
+
+function explainHappError(error) {
+  const message = String(error?.message || error || "Ошибка Happ API");
+  if (/HAPP_AUTH_KEY/i.test(message)) return message;
+  if (/active subscription/i.test(message)) return "Happ API отклонил запрос: для Limited Links/API нужна активная подписка провайдера на happ-proxy.com. Подписка в приложении Happ не заменяет подписку провайдера.";
+  if (/auth error/i.test(message)) return "Happ API отклонил ключ. Проверь HAPP_PROVIDER_ID и HAPP_AUTH_KEY в Render: Provider ID — 8 символов, auth_key — 32 символа.";
+  return `Happ API: ${message}`;
 }
 
 function requireAuth(store, config, req) {
@@ -99,16 +109,62 @@ export function createApp({ config = loadConfig(), store, threeXui, happ, fetchI
         if (req.method === "GET" && pathname === "/api/dashboard") return sendJson(res, 200, await actualStore.dashboard());
         if (req.method === "GET" && pathname === "/api/subscriptions") { const rows = await actualStore.listSubscriptions(); for (const row of rows) await syncSubscription(row, actualStore, xui, happClient); return sendJson(res, 200, (await actualStore.listSubscriptions()).map((row) => dto(row, req, config))); }
         if (req.method === "POST" && pathname === "/api/subscriptions") {
-          const input = normalizeSubscriptionInput(await readBody(req)); const rawToken = randomSecret(); const email = `vpn-${randomUUID().slice(0, 12)}`; const subId = randomSecret(18); let clientCreated = false;
-          try { const advancedMode = Boolean(config.threeXui.baseUrl && config.threeXui.inboundIds.length); let subscriptionUrl = config.legacyUpstreamUrl; let clientEmail = null; let subId = null; if (advancedMode) { await xui.addClient({ email, subId, totalGB: input.trafficLimitBytes, expiryTime: input.expiresAt ? new Date(input.expiresAt).getTime() : 0, limitIp: input.ipLimit, reset: input.resetPeriod }); clientCreated = true; subscriptionUrl = await xui.getSubscriptionUrl(email, subId); clientEmail = email; } let installCode = null; let installId = null; if (input.deviceLimit > 0 && config.happ.authKey && advancedMode) { const install = await happClient.createInstallLink(input.deviceLimit, input.name); installCode = install.install_code; installId = install.id; } if (!subscriptionUrl) throw new Error("Укажите UPSTREAM_SUBSCRIPTION_URL или настройте 3x-ui."); const row = await actualStore.insertSubscription({ ...input, email: clientEmail, subId, subscriptionUrl, installCode, installId, publicTokenHash: hashToken(rawToken), publicTokenPreview: rawToken.slice(-8), publicTokenCiphertext: encryptSecret(rawToken, config.sessionSecret), inboundIds: config.threeXui.inboundIds }, { email: clientEmail, subId }); await actualStore.audit("subscription_created", "subscription", row.id, { name: input.name, mode: advancedMode ? "3x-ui" : "simple" }); return sendJson(res, 201, { subscription: dto(row, req, config), url: publicUrl(config, req, rawToken, installCode, input.name) }); } catch (error) { if (clientCreated) await xui.deleteClient(email).catch(() => {}); return sendJson(res, 502, { error: error.message || "Не удалось создать подписку." }); }
+          const input = normalizeSubscriptionInput(await readBody(req)); const rawToken = randomSecret(); const email = `vpn-${randomUUID().slice(0, 12)}`; const subId = randomSecret(18); let clientCreated = false; let happInstallCreated = null;
+          try {
+            const advancedMode = Boolean(config.threeXui.baseUrl && config.threeXui.inboundIds.length);
+            let subscriptionUrl = config.legacyUpstreamUrl;
+            let clientEmail = null;
+            let installCode = null;
+            let installId = null;
+            if (advancedMode) {
+              await xui.addClient({ email, subId, totalGB: input.trafficLimitBytes, expiryTime: input.expiresAt ? new Date(input.expiresAt).getTime() : 0, limitIp: input.ipLimit, reset: resetDays(input.resetPeriod) });
+              clientCreated = true;
+              subscriptionUrl = await xui.getSubscriptionUrl(email, subId);
+              clientEmail = email;
+            }
+            if (input.deviceLimit > 0) {
+              if (!config.happ.authKey) throw new Error("Для лимита устройств заполните HAPP_AUTH_KEY в Render.");
+              const install = await happClient.createInstallLink(input.deviceLimit, input.name);
+              installCode = install.install_code;
+              installId = install.id;
+              happInstallCreated = installId;
+              if (!installCode) throw new Error("Happ API не вернул install_code.");
+            }
+            if (!subscriptionUrl) throw new Error("Укажите UPSTREAM_SUBSCRIPTION_URL или настройте 3x-ui.");
+            const row = await actualStore.insertSubscription({ ...input, email: clientEmail, subId, subscriptionUrl, installCode, installId, publicTokenHash: hashToken(rawToken), publicTokenPreview: rawToken.slice(-8), publicTokenCiphertext: encryptSecret(rawToken, config.sessionSecret), inboundIds: config.threeXui.inboundIds }, { email: clientEmail, subId });
+            await actualStore.audit("subscription_created", "subscription", row.id, { name: input.name, mode: advancedMode ? "3x-ui" : "simple", happLimited: Boolean(installCode) });
+            return sendJson(res, 201, { subscription: dto(row, req, config), url: publicUrl(config, req, rawToken, installCode, input.name) });
+          } catch (error) {
+            if (happInstallCreated && config.happ.authKey) await happClient.updateInstall(happInstallCreated, { status: 5 }).catch(() => {});
+            if (clientCreated) await xui.deleteClient(email).catch(() => {});
+            const message = error?.message || "Не удалось создать подписку.";
+            return sendJson(res, /Happ|HAPP|устройств/i.test(message) ? 400 : 502, { error: /Happ|HAPP|устройств/i.test(message) ? explainHappError(error) : message });
+          }
         }
         const subMatch = getRoute(pathname, /^\/api\/subscriptions\/([^/]+)$/);
         const actionMatch = getRoute(pathname, /^\/api\/subscriptions\/([^/]+)\/(enable|disable|rotate|devices)$/);
         if (req.method === "GET" && subMatch) { const row = await actualStore.getSubscriptionById(subMatch[1]); if (!row) return sendJson(res, 404, { error: "Подписка не найдена." }); await syncSubscription(row, actualStore, xui, happClient); const fresh = await actualStore.getSubscriptionById(row.id); return sendJson(res, 200, { subscription: dto(fresh, req, config), devices: (await actualStore.listDevices(row.id)).map(jsonSafe) }); }
         if (actionMatch && actionMatch[2] === "devices" && req.method === "GET") { const row = await actualStore.getSubscriptionById(actionMatch[1]); if (!row) return sendJson(res, 404, { error: "Подписка не найдена." }); await syncSubscription(row, actualStore, xui, happClient); return sendJson(res, 200, { devices: await actualStore.listDevices(row.id) }); }
-        if (actionMatch && ["enable", "disable"].includes(actionMatch[2]) && req.method === "POST") { const row = await actualStore.getSubscriptionById(actionMatch[1]); if (!row) return sendJson(res, 404, { error: "Подписка не найдена." }); const status = actionMatch[2] === "enable" ? "active" : "disabled"; if (row.three_xui_email) await xui.updateClient(row.three_xui_email, { email: row.three_xui_email, totalGB: row.traffic_limit_bytes, expiryTime: row.expires_at ? new Date(row.expires_at).getTime() : 0, limitIp: row.ip_limit, enable: status === "active" }); const updated = await actualStore.setSubscriptionStatus(row.id, status); if (row.install_id && config.happ.authKey) await happClient.updateInstall(row.install_id, { status: status === "active" ? 10 : 5 }); await actualStore.audit(`${status}_subscription`, "subscription", row.id); return sendJson(res, 200, { subscription: dto(updated, req, config) }); }
-        if (actionMatch && actionMatch[2] === "rotate" && req.method === "POST") { const row = await actualStore.getSubscriptionById(actionMatch[1]); if (!row) return sendJson(res, 404, { error: "Подписка не найдена." }); const raw = randomSecret(); const updated = await actualStore.rotateToken(row.id, hashToken(raw), raw.slice(-8), encryptSecret(raw, config.sessionSecret)); await actualStore.audit("subscription_token_rotated", "subscription", row.id); return sendJson(res, 200, { subscription: dto(updated, req, config), url: publicUrl(config, req, raw) }); }
-        if (req.method === "PATCH" && subMatch) { const row = await actualStore.getSubscriptionById(subMatch[1]); if (!row) return sendJson(res, 404, { error: "Подписка не найдена." }); const input = normalizeSubscriptionInput(await readBody(req)); if (row.three_xui_email) { const client = await xui.getClient(row.three_xui_email); const current = client?.obj?.client || client?.client || {}; await xui.updateClient(row.three_xui_email, { ...current, email: row.three_xui_email, totalGB: input.trafficLimitBytes, expiryTime: input.expiresAt ? new Date(input.expiresAt).getTime() : 0, limitIp: input.ipLimit, reset: resetDays(input.resetPeriod), enable: row.status === "active" }); } const updated = await actualStore.updateSubscription(row.id, input); await actualStore.audit("subscription_updated", "subscription", row.id); return sendJson(res, 200, { subscription: dto(updated, req, config) }); }
+        if (actionMatch && ["enable", "disable"].includes(actionMatch[2]) && req.method === "POST") { const row = await actualStore.getSubscriptionById(actionMatch[1]); if (!row) return sendJson(res, 404, { error: "Подписка не найдена." }); const status = actionMatch[2] === "enable" ? "active" : "disabled"; if (row.three_xui_email) await xui.updateClient(row.three_xui_email, { email: row.three_xui_email, totalGB: row.traffic_limit_bytes, expiryTime: row.expires_at ? new Date(row.expires_at).getTime() : 0, limitIp: row.ip_limit, enable: status === "active" }); if (row.install_id) { if (!config.happ.authKey) return sendJson(res, 400, { error: "Для управления лимитом устройств заполните HAPP_AUTH_KEY в Render." }); await happClient.updateInstall(row.install_id, { status: activeHappStatus(status), note: row.name }); } const updated = await actualStore.setSubscriptionStatus(row.id, status); await actualStore.audit(`${status}_subscription`, "subscription", row.id); return sendJson(res, 200, { subscription: dto(updated, req, config) }); }
+        if (actionMatch && actionMatch[2] === "rotate" && req.method === "POST") { const row = await actualStore.getSubscriptionById(actionMatch[1]); if (!row) return sendJson(res, 404, { error: "Подписка не найдена." }); const raw = randomSecret(); const updated = await actualStore.rotateToken(row.id, hashToken(raw), raw.slice(-8), encryptSecret(raw, config.sessionSecret)); await actualStore.audit("subscription_token_rotated", "subscription", row.id); return sendJson(res, 200, { subscription: dto(updated, req, config), url: publicUrl(config, req, raw, row.install_code, row.name) }); }
+        if (req.method === "PATCH" && subMatch) {
+          const row = await actualStore.getSubscriptionById(subMatch[1]); if (!row) return sendJson(res, 404, { error: "Подписка не найдена." });
+          const input = normalizeSubscriptionInput(await readBody(req));
+          if (row.three_xui_email) { const client = await xui.getClient(row.three_xui_email); const current = client?.obj?.client || client?.client || {}; await xui.updateClient(row.three_xui_email, { ...current, email: row.three_xui_email, totalGB: input.trafficLimitBytes, expiryTime: input.expiresAt ? new Date(input.expiresAt).getTime() : 0, limitIp: input.ipLimit, reset: resetDays(input.resetPeriod), enable: row.status === "active" }); }
+          let installCode = row.install_code;
+          let installId = row.install_id;
+          if (input.deviceLimit > 0) {
+            if (!config.happ.authKey) return sendJson(res, 400, { error: "Для лимита устройств заполните HAPP_AUTH_KEY в Render." });
+            if (row.install_id) await happClient.updateInstall(row.install_id, { install_limit: input.deviceLimit, status: activeHappStatus(row.status), note: input.name });
+            else { const install = await happClient.createInstallLink(input.deviceLimit, input.name); installCode = install.install_code; installId = install.id; if (!installCode) throw new Error("Happ API не вернул install_code."); }
+          } else if (row.install_id) {
+            if (!config.happ.authKey) return sendJson(res, 400, { error: "Для отключения старого лимита устройств нужен HAPP_AUTH_KEY в Render." });
+            await happClient.updateInstall(row.install_id, { status: 5, note: input.name });
+            installCode = null;
+            installId = null;
+          }
+          const updated = await actualStore.updateSubscription(row.id, input, { installCode, installId }); await actualStore.audit("subscription_updated", "subscription", row.id); return sendJson(res, 200, { subscription: dto(updated, req, config) });
+        }
         const deviceMatch = getRoute(pathname, /^\/api\/subscriptions\/([^/]+)\/devices\/(.+)$/); if (req.method === "DELETE" && deviceMatch) { const row = await actualStore.getSubscriptionById(deviceMatch[1]); if (!row) return sendJson(res, 404, { error: "Подписка не найдена." }); const hwid = decodeURIComponent(deviceMatch[2]); if (row.install_code) await happClient.deleteHwid(row.install_code, hwid); await actualStore.deleteDevice(row.id, hwid); await actualStore.audit("device_deleted", "subscription", row.id, { hwid: hwid.slice(0, 8) }); return sendJson(res, 200, { ok: true }); }
         if (req.method === "GET" && pathname === "/api/settings") return sendJson(res, 200, { providerId: config.happ.providerId, hasHappAuthKey: Boolean(config.happ.authKey), hasDatabase: Boolean(config.databaseUrl), hasThreeXui: Boolean(config.threeXui.baseUrl), inboundIds: config.threeXui.inboundIds, publicBaseUrl: config.publicBaseUrl, settings: await actualStore.getSettings() });
         if (req.method === "PATCH" && pathname === "/api/settings") { const body = await readBody(req); const allowed = {}; if (body.defaultSupportUrl !== undefined && validUrl(body.defaultSupportUrl)) allowed.defaultSupportUrl = String(body.defaultSupportUrl); if (body.domainName !== undefined) allowed.domainName = String(body.domainName).trim().slice(0, 255); await actualStore.setSettings(allowed); await actualStore.audit("settings_updated", "settings", null, allowed); return sendJson(res, 200, { settings: await actualStore.getSettings() }); }
@@ -121,7 +177,7 @@ export function createApp({ config = loadConfig(), store, threeXui, happ, fetchI
       if (req.method === "GET" && pathname === "/" || req.method === "GET" && pathname === "/index.html") { const html = await fs.readFile(path.join(PUBLIC_DIR, "index.html")); res.writeHead(200, { "content-type": "text/html; charset=utf-8" }); res.end(html); return; }
       if (req.method === "GET" && ["/styles.css", "/app.js"].includes(pathname)) { const file = await fs.readFile(path.join(PUBLIC_DIR, pathname.slice(1))); res.writeHead(200, { "content-type": pathname.endsWith(".css") ? "text/css; charset=utf-8" : "application/javascript; charset=utf-8" }); res.end(file); return; }
       sendText(res, 404, "Not found");
-    } catch (error) { sendJson(res, 400, { error: error.message || "Request failed." }); }
+    } catch (error) { const message = error?.message || "Request failed."; sendJson(res, 400, { error: /active subscription|auth error|Happ API/i.test(message) ? explainHappError(error) : message }); }
   });
   app.store = actualStore; app.config = config; return app;
 }
