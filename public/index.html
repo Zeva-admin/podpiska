@@ -1,0 +1,62 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>VPN Panel</title>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <div id="toast" class="toast"></div>
+  <main id="app" class="shell">
+    <section id="login-view" class="auth-card">
+      <div class="brand-mark">VP</div>
+      <p class="eyebrow">CONTROL CENTER</p>
+      <h1>VPN Panel</h1>
+      <p class="muted">Управление персональными подписками</p>
+      <form id="login-form" class="stack">
+        <label>Логин<input name="username" value="admin" autocomplete="username" required></label>
+        <label>Пароль<input name="password" type="password" autocomplete="current-password" required></label>
+        <button class="button primary" type="submit">Войти</button>
+        <p id="login-error" class="error"></p>
+      </form>
+    </section>
+
+    <section id="password-view" class="auth-card hidden">
+      <div class="brand-mark">VP</div>
+      <p class="eyebrow">FIRST SIGN-IN</p>
+      <h1>Смените пароль</h1>
+      <p class="muted">Пароль admin/admin действует только до первого входа.</p>
+      <form id="password-form" class="stack">
+        <label>Новый пароль<input name="password" type="password" minlength="10" required></label>
+        <label>Повторите пароль<input name="repeat" type="password" minlength="10" required></label>
+        <button class="button primary" type="submit">Сохранить пароль</button>
+        <p id="password-error" class="error"></p>
+      </form>
+    </section>
+
+    <section id="panel-view" class="hidden">
+      <header class="topbar">
+        <div class="brand"><span class="brand-mark small">VP</span><span><strong>VPN Panel</strong><small>subscription control</small></span></div>
+        <div class="top-actions"><span id="current-user" class="muted"></span><button id="logout-button" class="button ghost">Выйти</button></div>
+      </header>
+      <div class="layout">
+        <aside class="sidebar">
+          <button class="nav-item active" data-page="dashboard">Обзор</button>
+          <button class="nav-item" data-page="subscriptions">Подписки</button>
+          <button class="nav-item" data-page="settings">Настройки</button>
+          <div class="sidebar-note"><span class="status-dot"></span><span>Production ready<br><small>Supabase · 3x-ui · Happ</small></span></div>
+        </aside>
+        <div class="content">
+          <section id="page-dashboard" class="page"></section>
+          <section id="page-subscriptions" class="page hidden"></section>
+          <section id="page-settings" class="page hidden"></section>
+        </div>
+      </div>
+    </section>
+  </main>
+  <dialog id="subscription-dialog" class="modal"><div id="subscription-dialog-content"></div></dialog>
+  <script src="/app.js" type="module"></script>
+</body>
+</html>
