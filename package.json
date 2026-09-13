@@ -1,0 +1,16 @@
+{
+  "name": "vpn-panel",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Dark graphite admin panel for personal VPN subscriptions",
+  "type": "module",
+  "engines": { "node": ">=20" },
+  "scripts": {
+    "start": "node server.mjs",
+    "test": "node --test"
+  },
+  "dependencies": {
+    "pg": "^8.16.3",
+    "qrcode": "^1.5.4"
+  }
+}

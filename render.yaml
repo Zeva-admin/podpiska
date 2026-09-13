@@ -1,0 +1,17 @@
+services:
+  - type: web
+    name: vpn-panel
+    runtime: node
+    plan: free
+    buildCommand: npm install
+    startCommand: npm start
+    autoDeploy: true
+    envVars:
+      - key: NODE_VERSION
+        value: 20
+      - key: DATABASE_URL
+        sync: false
+      - key: SESSION_SECRET
+        generateValue: true
+      - key: UPSTREAM_SUBSCRIPTION_URL
+        sync: false
